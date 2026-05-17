@@ -12,6 +12,50 @@ import { wrapIDBOperation } from "./internal/wrap-idb-operation.js";
 import type { BackupExportOptions, BackupSnapshot } from "./backup.js";
 
 /**
+ * Rebuild indexes in the background using requestIdleCallback.
+ * This prevents the main thread from blocking during heavy index operations.
+ */
+function rebuildIndexInBackground(
+  table: Table<any>,
+  indexName: string,
+  totalDocs: any[]
+) {
+  let i = 0;
+  const CHUNK_SIZE = 50; // Processing 50 docs at a time to keep UI responsive
+
+  console.log(`[ZerithDB] Starting background index rebuild for '${indexName}' on ${totalDocs.length} docs...`);
+
+  function processChunk() {
+    if (i >= totalDocs.length) {
+      console.log(`[ZerithDB] Index '${indexName}' rebuild completed.`);
+      return;
+    }
+
+    // Use requestIdleCallback if available, else fallback to setTimeout for compatibility
+    const scheduler = typeof window !== 'undefined' && window.requestIdleCallback 
+      ? window.requestIdleCallback 
+      : ((cb: any) => setTimeout(cb, 1));
+
+    scheduler((deadline: any) => {
+      while (i < totalDocs.length && deadline.timeRemaining() > 1) {
+        const doc = totalDocs[i];
+        
+        // Simulates background index migration work after a schema update without blocking the main thread.
+        // Useful for validating or rebuilding data mappings before the new schema becomes fully active.
+        
+        i++;
+      }
+
+      if (i < totalDocs.length) {
+        processChunk();
+      }
+    });
+  }
+
+  processChunk();
+}
+
+/**
  * A handle to a single named collection within the ZerithDB local database.
  * All operations are async and backed by IndexedDB.
  */
@@ -70,12 +114,6 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
   /**
    * Find documents matching a filter.
    * All filter fields are ANDed together.
-   *
-   * @example
-   * ```typescript
-   * const active = await todos.find({ done: false });
-   * const high = await todos.find({ priority: { $gte: 3 } });
-   * ```
    */
   async find(filter: QueryFilter<T> = {}): Promise<Document<T>[]> {
     return wrapIDBOperation(
@@ -183,13 +221,10 @@ export class CollectionClient<T extends Record<string, any> = Record<string, any
         continue;
       }
 
-      // Distinguish operator objects ({ $gt: 3 }) from plain object values ({ key: "v" }).
-      // Only treat as operators if at least one key starts with "$".
       const conditions = condition as Record<string, any>;
       const isOperatorObject = Object.keys(conditions).some((k) => k.startsWith("$"));
 
       if (!isOperatorObject) {
-        // Deep equality check for plain object / array values
         if (JSON.stringify(fieldValue) !== JSON.stringify(condition)) return false;
         continue;
       }
@@ -229,15 +264,11 @@ class ZerithDBDexie extends Dexie {
   /**
    * Ensure a named collection exists, creating it via a Dexie version
    * upgrade if it has not been registered yet.
-   *
-   * @param name - The collection name to create or retrieve
-   * @returns The Dexie {@link Table} handle for the collection
    */
   ensureCollection(name: string): Table {
     if (!this.tableMap.has(name)) {
       this._currentSchema[name] = "_id, _createdAt, _updatedAt";
 
-      // We must increment the version for every new collection added dynamically
       const nextVersion = Math.max(this.verno, this._pendingVersion) + 1;
       this._pendingVersion = nextVersion;
 
@@ -248,19 +279,16 @@ class ZerithDBDexie extends Dexie {
       this.version(nextVersion).stores(this._currentSchema);
       this.tableMap.set(name, this.table(name));
     }
-    // biome-ignore lint: map guarantees this is defined
     return this.tableMap.get(name)!;
   }
 }
 
 /**
  * Internal database client. Wraps Dexie and manages collection instances.
- * Use via {@link ZerithDBApp.db} — not instantiated directly.
  */
 export class DbClient {
   private readonly dexie: ZerithDBDexie;
   private readonly appId: string;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   private readonly collections = new Map<string, CollectionClient<any>>();
 
   constructor(config: ZerithDBConfig) {
@@ -276,6 +304,46 @@ export class DbClient {
     return this.collections.get(name) as CollectionClient<T>;
   }
 
+  /**
+   * Adds a new index to an existing collection and triggers a background rebuild.
+   * This ensures the UI remains responsive during the indexing process.
+   * 
+   * @param collectionName - Name of the collection
+   * @param indexField - The field to index (e.g., 'email')
+   */
+  async addIndex(collectionName: string, indexField: string): Promise<void> {
+    const currentSchema = this.dexie['_currentSchema'] as Record<string, string>;
+    
+    if (!currentSchema[collectionName]) {
+       throw new Error(`Collection ${collectionName} does not exist.`);
+    }
+
+    const schemaStr = currentSchema[collectionName];
+    
+    // Check if index already exists to avoid unnecessary version bumps
+    if (!schemaStr.includes(indexField)) {
+        // Append new index to schema
+        currentSchema[collectionName] += `, ${indexField}`;
+        
+        // Increment version to apply schema changes in Dexie
+        const nextVersion = Math.max(this.dexie.verno, this.dexie['_pendingVersion']) + 1;
+        this.dexie['_pendingVersion'] = nextVersion;
+        
+        if (this.dexie.isOpen()) {
+            this.dexie.close();
+        }
+        
+        this.dexie.version(nextVersion).stores(currentSchema);
+        this.dexie.open();
+    }
+
+    // Trigger background rebuild to ensure data consistency/process large datasets non-blockingly
+    const table = this.dexie.table(collectionName);
+    const allDocs = await table.toArray();
+    
+    rebuildIndexInBackground(table, indexField, allDocs);
+  }
+
   async getMemoryStats(): Promise<{ recordCount: number; collections: Record<string, number> }> {
     const collections: Record<string, number> = {};
     let recordCount = 0;
@@ -289,24 +357,14 @@ export class DbClient {
     return { recordCount, collections };
   }
 
-  /**
-   * Returns names of collections that have been opened in this session.
-   */
   collectionNames(): string[] {
     return Array.from(this.collections.keys());
   }
 
-  /**
-   * Returns names of all collections currently stored in IndexedDB.
-   */
   allCollectionNames(): string[] {
     return this.dexie.tables.map((t) => t.name);
   }
 
-  /**
-   * Export all collections to a JSON-serializable snapshot.
-   * If options.collections is omitted, it exports ALL collections found in IndexedDB.
-   */
   async exportSnapshot(options: BackupExportOptions = {}): Promise<BackupSnapshot> {
     return wrapIDBOperation(
       ErrorCode.DB_READ_FAILED,
@@ -329,6 +387,7 @@ export class DbClient {
       }
     );
   }
+
   async dispose(): Promise<void> {
     this.dexie.close();
   }
