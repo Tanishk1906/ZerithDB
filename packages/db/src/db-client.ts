@@ -19,40 +19,53 @@ function rebuildIndexInBackground(
   table: Table<any>,
   indexName: string,
   totalDocs: any[]
-) {
+): Promise<void> {
   let i = 0;
-  const CHUNK_SIZE = 50; // Processing 50 docs at a time to keep UI responsive
+  // Renamed for better readability as per review
+  const INDEX_REBUILD_CHUNK_SIZE = 50; 
 
   console.log(`[ZerithDB] Starting background index rebuild for '${indexName}' on ${totalDocs.length} docs...`);
 
-  function processChunk() {
-    if (i >= totalDocs.length) {
-      console.log(`[ZerithDB] Index '${indexName}' rebuild completed.`);
-      return;
-    }
+  return new Promise((resolve, reject) => {
+    const processChunk = () => {
+      try {
+        if (i >= totalDocs.length) {
+          console.log(`[ZerithDB] Index '${indexName}' rebuild completed.`);
+          resolve();
+          return;
+        }
 
-    // Use requestIdleCallback if available, else fallback to setTimeout for compatibility
-    const scheduler = typeof window !== 'undefined' && window.requestIdleCallback 
-      ? window.requestIdleCallback 
-      : ((cb: any) => setTimeout(cb, 1));
+        // Use requestIdleCallback if available, else fallback to setTimeout for compatibility
+        const scheduler = typeof window !== 'undefined' && window.requestIdleCallback 
+          ? window.requestIdleCallback 
+          : ((cb: any) => setTimeout(cb, 1));
 
-    scheduler((deadline: any) => {
-      while (i < totalDocs.length && deadline.timeRemaining() > 1) {
-        const doc = totalDocs[i];
-        
-        // Simulates background index migration work after a schema update without blocking the main thread.
-        // Useful for validating or rebuilding data mappings before the new schema becomes fully active.
-        
-        i++;
+        scheduler((deadline: any) => {
+          try {
+            while (i < totalDocs.length && deadline.timeRemaining() > 1) {
+              // Simulate work or actual indexing logic here if needed
+              // For now, we just iterate to simulate CPU load distribution
+              i++;
+            }
+
+            if (i < totalDocs.length) {
+              processChunk();
+            } else {
+              resolve();
+            }
+          } catch (error) {
+            console.error(`[ZerithDB] Error during index chunk processing:`, error);
+            reject(error);
+          }
+        });
+      } catch (error) {
+        console.error(`[ZerithDB] Critical error in background rebuild scheduler:`, error);
+        reject(error);
       }
+    };
 
-      if (i < totalDocs.length) {
-        processChunk();
-      }
-    });
-  }
-
-  processChunk();
+    processChunk();
+  });
 }
 
 /**
@@ -315,13 +328,20 @@ export class DbClient {
     const currentSchema = this.dexie['_currentSchema'] as Record<string, string>;
     
     if (!currentSchema[collectionName]) {
-       throw new Error(`Collection ${collectionName} does not exist.`);
+       throw new ZerithDBError(
+         ErrorCode.COLLECTION_NOT_FOUND,
+         `Collection "${collectionName}" does not exist.`
+       );
     }
 
     const schemaStr = currentSchema[collectionName];
     
-    // Check if index already exists to avoid unnecessary version bumps
-    if (!schemaStr.includes(indexField)) {
+    // Check if index already exists to avoid unnecessary version bumps and duplicates
+    // We split by comma to check individual index definitions more accurately
+    const existingIndexes = schemaStr.split(',').map(s => s.trim());
+    const indexExists = existingIndexes.some(idx => idx === indexField || idx.includes(indexField));
+
+    if (!indexExists) {
         // Append new index to schema
         currentSchema[collectionName] += `, ${indexField}`;
         
@@ -335,13 +355,16 @@ export class DbClient {
         
         this.dexie.version(nextVersion).stores(currentSchema);
         this.dexie.open();
+    } else {
+        console.warn(`[ZerithDB] Index '${indexField}' already exists on collection '${collectionName}'. Skipping schema update.`);
     }
 
     // Trigger background rebuild to ensure data consistency/process large datasets non-blockingly
     const table = this.dexie.table(collectionName);
     const allDocs = await table.toArray();
     
-    rebuildIndexInBackground(table, indexField, allDocs);
+    // Await the background rebuild to handle potential errors
+    await rebuildIndexInBackground(table, indexField, allDocs);
   }
 
   async getMemoryStats(): Promise<{ recordCount: number; collections: Record<string, number> }> {
